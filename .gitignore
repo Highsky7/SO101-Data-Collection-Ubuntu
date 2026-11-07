@@ -1,0 +1,29 @@
+# Local environments and generated files
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+.cache/
+
+# Robot data, device calibration, session logs, and backups stay local
+/data/
+/calibration/
+/logs/
+/backups/
+*.mp4
+*.avi
+*.parquet
+*.arrow
+*.tar
+*.tar.gz
+
+# Credentials and model artifacts must never enter this public repository
+.env
+.env.*
+.netrc
+*.pem
+*.key
+*.safetensors
+*.pt
+*.pth
+*.ckpt

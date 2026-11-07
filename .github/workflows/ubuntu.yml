@@ -1,0 +1,55 @@
+name: Ubuntu hardware-free verification
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Ubuntu ${{ matrix.version }}
+    runs-on: ubuntu-${{ matrix.version }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["22.04", "24.04"]
+    permissions:
+      contents: read
+    env:
+      UV_TORCH_BACKEND: cpu
+      CUDA_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.7"
+          enable-cache: false
+      - name: Install FFmpeg and build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes ffmpeg build-essential python3-dev linux-libc-dev
+      - name: Install project environment
+        run: bash setup_ubuntu.sh
+      - name: Confirm installer preserves the existing environment
+        run: |
+          if bash setup_ubuntu.sh; then
+            echo 'Installer unexpectedly replaced the existing environment' >&2
+            exit 1
+          fi
+      - name: Check installed dependencies
+        run: uv pip check --python .venv/bin/python
+      - name: Check LeRobot CLI help
+        run: |
+          # find-port is interactive and does not implement --help in LeRobot 0.7.0.
+          .venv/bin/lerobot-record --help
+          .venv/bin/lerobot-teleoperate --help
+          .venv/bin/lerobot-calibrate --help
+          .venv/bin/lerobot-setup-motors --help
+          .venv/bin/lerobot-find-cameras --help
+          .venv/bin/lerobot-dataset-viz --help
+      - name: Run hardware-free regression check
+        run: .venv/bin/python check_environment.py
