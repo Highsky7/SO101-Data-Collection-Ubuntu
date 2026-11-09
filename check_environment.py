@@ -1,4 +1,4 @@
-"""Exercise local LeRobot video recording, fresh-process resume, and decoding.
+"""Exercise local LeRobot imports, video recording, fresh-process resume, and decoding.
 
 Uses synthetic images and joint values only. Never opens cameras or serial ports,
 never moves a robot, and never uploads data. Temporary data is removed on exit.
@@ -113,11 +113,7 @@ def verify_dataset(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--codec",
-        default="h264_videotoolbox" if sys.platform == "darwin" else "h264",
-        help="Video encoder (default: h264_videotoolbox on macOS, h264 elsewhere)",
-    )
+    parser.add_argument("--codec", default="h264_videotoolbox")
     parser.add_argument("--phase", choices=("create", "resume", "verify"))
     parser.add_argument("--root", type=Path)
     args = parser.parse_args()
@@ -130,7 +126,7 @@ def main():
             record_episode(args.root, int(args.phase == "resume"), args.codec)
         return
 
-    for module in ("cv2", "av", "torch", "torchcodec", "rustypot", "serial", "lerobot.robots.so_follower", "lerobot.teleoperators.so_leader"):
+    for module in ("rerun", "cv2", "av", "torch", "torchcodec", "rustypot", "serial", "lerobot.robots.so_follower", "lerobot.teleoperators.so_leader"):
         importlib.import_module(module)
     packages = ("lerobot", "torch", "torchvision", "torchcodec", "av", "opencv-python-headless", "rustypot", "rerun-sdk")
     print(json.dumps({name: importlib.metadata.version(name) for name in packages}, indent=2), flush=True)

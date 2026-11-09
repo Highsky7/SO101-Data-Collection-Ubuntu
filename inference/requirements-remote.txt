@@ -1,0 +1,4 @@
+# Native LeRobot 0.7.0 remote extra only; install into inference/runtime/deps.
+# No policy/transformers/RealSense changes in the Mac collection environment.
+eclipse-zenoh==1.9.0
+msgpack==1.1.2

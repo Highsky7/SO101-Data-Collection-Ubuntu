@@ -1,0 +1,5 @@
+# SO-ARM101 data collection only; no policy/training extras.
+lerobot[core_scripts,feetech]==0.7.0
+# TorchCodec >=0.12 supports torch >=2.11 and system FFmpeg.
+torch>=2.11,<2.16
+torchcodec>=0.12,<0.18

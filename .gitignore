@@ -1,15 +1,25 @@
 # Local environments and generated files
-.venv/
+.venv*/
+.venv*
 __pycache__/
 *.py[cod]
 .DS_Store
 .cache/
+*.log
+*.rrd
+*.npz
+*.npy
 
-# Robot data, device calibration, session logs, and backups stay local
+# Robot data, calibration, logs, backups, and training records stay local
 /data/
 /calibration/
 /logs/
 /backups/
+/training/
+/ubuntu/data/
+/ubuntu/calibration/
+/ubuntu/logs/
+/ubuntu/backups/
 *.mp4
 *.avi
 *.parquet
@@ -17,10 +27,26 @@ __pycache__/
 *.tar
 *.tar.gz
 
+# Private deployment descriptors, verification results, and dependency overlays
+/inference/runtime/
+/inference/*verification*.json
+*.deployment.json
+deployment.json
+cameras*.json
+/inference/*equivalence*.json
+
+# Local operational guides contain server/run details; public instructions are in README.md
+/SO101_데이터수집_가이드.md
+/SO101_추론_가이드.md
+
+# Built third-party SDK wheels stay local; publish build sources instead
+/wheels/
+
 # Credentials and model artifacts must never enter this public repository
 .env
 .env.*
 .netrc
+*.env
 *.pem
 *.key
 *.safetensors

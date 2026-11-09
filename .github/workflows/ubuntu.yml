@@ -19,6 +19,9 @@ jobs:
         version: ["22.04", "24.04"]
     permissions:
       contents: read
+    defaults:
+      run:
+        working-directory: ubuntu
     env:
       UV_TORCH_BACKEND: cpu
       CUDA_VISIBLE_DEVICES: ""
@@ -53,3 +56,5 @@ jobs:
           .venv/bin/lerobot-dataset-viz --help
       - name: Run hardware-free regression check
         run: .venv/bin/python check_environment.py
+      - name: Run hardware-free inference regressions
+        run: .venv/bin/python -m unittest discover -s ../inference -p 'test_so101_*.py' -v

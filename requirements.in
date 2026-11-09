@@ -1,5 +1,6 @@
 # SO-ARM101 data collection only; no policy/training extras.
-lerobot[core_scripts,feetech]==0.7.0
+lerobot[core_scripts,feetech,intelrealsense,pyzmq-dep]==0.7.0
+./wheels/pyrealsense2_macosx-2.56.5+macos.rgb1-cp312-cp312-macosx_15_0_arm64.whl ; sys_platform == "darwin"
 # TorchCodec >=0.12 supports torch >=2.11 and system FFmpeg.
 torch>=2.11,<2.16
 torchcodec>=0.12,<0.18
