@@ -134,22 +134,28 @@ def require_gpu0(
         if hashlib.sha256(raw).hexdigest() != deployment["training_config_sha256"]:
             raise ValueError("Training config changed since deployment preparation; refusing its MPS allowlist")
         config = json.loads(raw)
-        if not isinstance(config, dict) or config.get("gpu_uuid") != expected_uuid:
+        runtime = deployment.get("runtime")
+        admission_config = config if runtime is None else runtime
+        if not isinstance(admission_config, dict) or admission_config.get("gpu_uuid") != expected_uuid:
             raise ValueError("Admission config differs from the selected physical GPU")
-        idle_mps_pids = config.get("idle_mps_pids", ())
+        # Training-host PID approvals must never apply to a relocated Ubuntu host.
+        idle_mps_pids = config.get("idle_mps_pids", ()) if runtime is None else ()
         if not isinstance(idle_mps_pids, (list, tuple)) or any(type(pid) is not int or pid <= 0 for pid in idle_mps_pids):
             raise ValueError("idle_mps_pids must contain positive integer process IDs")
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible is not None and visible not in {"0", expected_uuid}:
-        raise RuntimeError("CUDA_VISIBLE_DEVICES differs from the selected physical GPU0; not overridden")
+    relocated = deployment is not None and deployment.get("runtime") is not None
+    allowed_visible = {expected_uuid} if relocated else {"0", expected_uuid}
+    if visible is not None and visible not in allowed_visible:
+        raise RuntimeError("CUDA_VISIBLE_DEVICES differs from the selected physical GPU; not overridden")
     result = subprocess.run(
         ["nvidia-smi", f"--id={expected_uuid}", "--query-gpu=index,uuid,gpu_recovery_action",
          "--format=csv,noheader"],
         check=True, capture_output=True, text=True, timeout=10,
     )
     fields = [field.strip() for field in result.stdout.strip().split(",")]
-    if fields != ["0", expected_uuid, "None"]:
-        raise RuntimeError(f"GPU0 is not ready; no reset or fallback GPU will be attempted: {fields}")
+    valid_index = len(fields) == 3 and fields[0].isdigit() and (relocated or fields[0] == "0")
+    if not valid_index or fields[1:] != [expected_uuid, "None"]:
+        raise RuntimeError(f"Selected GPU is not ready; no reset or fallback GPU will be attempted: {fields}")
     processes = subprocess.run(
         ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv,noheader,nounits"],
         check=True, capture_output=True, text=True, timeout=10,
@@ -180,7 +186,7 @@ def require_gpu0(
         budget = int(memory_limit_gib * 1024**3)
         if budget < 1 or free_mib * 1024**2 < budget + GPU_RESERVE_BYTES:
             raise RuntimeError("Inference needs its memory limit plus 4 GiB free GPU reserve; nothing was stopped")
-    # UUID pins physical GPU0, which is the process-local cuda:0.
+    # An explicit physical UUID becomes the worker's process-local cuda:0.
     os.environ["CUDA_VISIBLE_DEVICES"] = expected_uuid
     for key in ("CUDA_MPS_PIPE_DIRECTORY", "CUDA_MPS_LOG_DIRECTORY"):
         os.environ.pop(key, None)

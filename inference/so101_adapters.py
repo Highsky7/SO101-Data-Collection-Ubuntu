@@ -63,6 +63,7 @@ _REQUIRED_DESCRIPTOR_KEYS = frozenset(
         "source_sha256",
     }
 )
+_RUNTIME_KEYS = frozenset({"root", "python", "gpu_uuid"})
 
 
 def validate_memory_limit(memory_limit_gib: float | None) -> float | None:
@@ -172,7 +173,10 @@ def _validate_progress_shape(model: str, progress: Any) -> None:
 
 def _validate_descriptor(spec: Any, model: str | None = None) -> dict[str, Any]:
     """Validate descriptor structure and self-binding without resolving server paths."""
-    if not isinstance(spec, dict) or set(spec) != _REQUIRED_DESCRIPTOR_KEYS:
+    if not isinstance(spec, dict) or set(spec) not in (
+        _REQUIRED_DESCRIPTOR_KEYS,
+        _REQUIRED_DESCRIPTOR_KEYS | {"runtime"},
+    ):
         raise ValueError("deployment descriptor keys do not match the supported schema")
     if spec["schema"] != SCHEMA or spec["semantics"] != SEMANTICS:
         raise ValueError("unsupported SO101 adapter descriptor schema or semantics")
@@ -193,6 +197,24 @@ def _validate_descriptor(spec: Any, model: str | None = None) -> dict[str, Any]:
         raise ValueError("pythonpath entries must be unique")
     if not isinstance(spec["gpu_uuid"], str) or not re.fullmatch(r"GPU-[A-Za-z0-9-]+", spec["gpu_uuid"]):
         raise ValueError("gpu_uuid must identify a physical NVIDIA GPU")
+    if "runtime" in spec:
+        runtime = spec["runtime"]
+        if name != "rdvla" or not isinstance(runtime, dict) or set(runtime) != _RUNTIME_KEYS:
+            raise ValueError("runtime relocation is supported only for RD-VLA with root, python, and gpu_uuid")
+        runtime_root = _path(runtime["root"], "runtime root", strict=False)
+        if not isinstance(runtime["python"], str) or not Path(runtime["python"]).is_absolute():
+            raise ValueError("runtime python must be an absolute path")
+        if not isinstance(runtime["gpu_uuid"], str) or not re.fullmatch(r"GPU-[A-Za-z0-9-]+", runtime["gpu_uuid"]):
+            raise ValueError("runtime gpu_uuid must identify a physical NVIDIA GPU")
+        runtime_source = str(runtime_root / "source")
+        if (
+            spec["python"] != runtime["python"]
+            or spec["gpu_uuid"] != runtime["gpu_uuid"]
+            or spec["source_root"] != runtime_source
+            or spec["pythonpath"] != [runtime_source]
+            or Path(spec["checkpoint"]).parent != runtime_root / "runs" / "rdvla" / "checkpoints"
+        ):
+            raise ValueError("runtime paths or hardware differ from the descriptor")
     _hash_value(spec["checkpoint_manifest_sha256"], "checkpoint_manifest_sha256")
     _hash_value(spec["training_config_sha256"], "training_config_sha256")
     _hash_value(spec["source_sha256"], "source_sha256")
@@ -344,6 +366,42 @@ def _compat_configs(config: dict[str, Any], config_root: Path, model: str) -> li
     return compatible
 
 
+def _normalize_runtime(runtime: Any) -> dict[str, str]:
+    if not isinstance(runtime, dict) or set(runtime) != _RUNTIME_KEYS:
+        raise ValueError("runtime must contain exactly root, python, and gpu_uuid")
+    root_value = runtime["root"]
+    if not isinstance(root_value, str) or not Path(root_value).is_absolute():
+        raise ValueError("runtime root must be an absolute path")
+    root_input = Path(root_value)
+    if root_input.is_symlink():
+        raise ValueError("runtime root must not be a symlink")
+    root = _path(root_value, "runtime root")
+    if not root.is_dir():
+        raise ValueError(f"runtime root is not a directory: {root}")
+    python = _executable(runtime["python"], "runtime python")
+    gpu_uuid = runtime["gpu_uuid"]
+    if not isinstance(gpu_uuid, str) or not re.fullmatch(r"GPU-[A-Za-z0-9-]+", gpu_uuid):
+        raise ValueError("runtime gpu_uuid must identify a physical NVIDIA GPU")
+    return {"root": str(root), "python": str(python), "gpu_uuid": gpu_uuid}
+
+
+def _verify_runtime_checkpoint(runtime: dict[str, str], checkpoint: Path) -> None:
+    runtime_root = Path(runtime["root"])
+    checkpoint_root = runtime_root / "runs" / "rdvla" / "checkpoints"
+    for directory in (runtime_root / "runs", runtime_root / "runs" / "rdvla", checkpoint_root):
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError(f"runtime checkpoint directory is missing or a symlink: {directory}")
+    if checkpoint.parent != checkpoint_root:
+        raise ValueError("RD-VLA checkpoint must be directly inside the runtime checkpoint root")
+
+
+def _original_rd_checkpoint(config: dict[str, Any], checkpoint: Path) -> Path:
+    root = config.get("root")
+    if not isinstance(root, str) or not Path(root).is_absolute():
+        raise ValueError("training root must be an absolute path")
+    return Path(root) / "runs" / "rdvla" / "checkpoints" / checkpoint.name
+
+
 def _verify_checkpoint_root(config: dict[str, Any], model: str, checkpoint: Path) -> tuple[Path, Path]:
     root = _path(config.get("root"), "training root")
     checkpoint_root = (root / "runs" / model / "checkpoints").resolve(strict=True)
@@ -352,16 +410,38 @@ def _verify_checkpoint_root(config: dict[str, Any], model: str, checkpoint: Path
     return root, checkpoint_root
 
 
-def _verify_model_settings(config: dict[str, Any], model: str) -> tuple[dict[str, Any], Path, Path, list[str]]:
+def _verify_model_settings(
+    config: dict[str, Any], model: str, *, runtime: dict[str, str] | None = None
+) -> tuple[dict[str, Any], Path, Path, list[str]]:
     model_cfg = _model_config(config, model)
     if config.get("action_horizon") != PREDICTION_STEPS or config.get("execution_horizon") != PREDICTION_STEPS:
         raise ValueError("training config must retain the trained SO101 50-step prediction/execution horizons")
-    root = _path(config.get("root"), "training root")
-    if "source_root" in config:
-        source_root = _path(config["source_root"], "source_root")
+    if runtime is None:
+        root = _path(config.get("root"), "training root")
+        if "source_root" in config:
+            source_root = _path(config["source_root"], "source_root")
+        else:
+            source_root = (root / "source").resolve(strict=True)
+        _executable(model_cfg.get("python"), "training python")
     else:
-        source_root = (root / "source").resolve(strict=True)
-    python = _executable(model_cfg.get("python"), "training python")
+        if model != "rdvla":
+            raise ValueError("runtime relocation is supported only for RD-VLA")
+        root = _path(config.get("root"), "training root", strict=False)
+        if "source_root" in config:
+            _path(config["source_root"], "source_root", strict=False)
+        if not isinstance(model_cfg.get("python"), str) or not Path(model_cfg["python"]).is_absolute():
+            raise ValueError("original training python must be an absolute path")
+        original_gpu = config.get("gpu_uuid")
+        if not isinstance(original_gpu, str) or not re.fullmatch(r"GPU-[A-Za-z0-9-]+", original_gpu):
+            raise ValueError("training config must pin a physical GPU UUID")
+        runtime_root = _path(runtime["root"], "runtime root")
+        source_root = runtime_root / "source"
+        if source_root.is_symlink() or not source_root.is_dir():
+            raise ValueError(f"runtime source tree is missing or a symlink: {source_root}")
+        native_root = source_root / "RD-VLA"
+        if native_root.is_symlink() or not native_root.is_dir():
+            raise ValueError(f"runtime source tree lacks RD-VLA: {native_root}")
+        _executable(runtime["python"], "runtime python")
     adapter_file = source_root / f"{model}_adapter.py"
     if not adapter_file.is_file() or adapter_file.is_symlink():
         raise ValueError(f"native {model} adapter is missing from the configured source tree")
@@ -478,14 +558,22 @@ def _rd_source_candidates(
 
 
 def _check_rd_progress(
-    config: dict[str, Any], config_root: Path, source_root: Path, model: str, progress: dict[str, Any], checkpoint: Path
+    config: dict[str, Any],
+    config_root: Path,
+    source_root: Path,
+    model: str,
+    progress: dict[str, Any],
+    checkpoint: Path,
+    *,
+    identity_checkpoint: Path | None = None,
 ) -> None:
     identity = progress["identity"]
     if identity.get("run_id") != config.get("run_id") or identity.get("model") != model:
         raise ValueError("RD-VLA checkpoint run/model lineage differs from training config")
     if identity.get("manifest_sha256") != _hash_value(config.get("manifest_sha256"), "manifest_sha256"):
         raise ValueError("RD-VLA checkpoint dataset manifest differs from training config")
-    if progress.get("checkpoint") != str(checkpoint):
+    expected_checkpoint = checkpoint if identity_checkpoint is None else identity_checkpoint
+    if progress.get("checkpoint") != str(expected_checkpoint):
         raise ValueError("RD-VLA progress points to a different checkpoint directory")
     candidates = _rd_source_candidates(config, config_root, model)
     saved_files = identity.get("source_files")
@@ -528,6 +616,8 @@ def _check_rd_progress(
         or type(frames_per_epoch) is not int or frames_per_epoch <= 0
     ):
         raise ValueError("RD-VLA checkpoint progress counters are absent or invalid")
+
+
 def _validate_checkpoint_name(model: str, checkpoint: Path, progress: dict[str, Any], config: dict[str, Any]) -> None:
     if model == "rdvla":
         step = re.fullmatch(r"step-(\d+)", checkpoint.name)
@@ -561,7 +651,16 @@ def _validate_checkpoint_name(model: str, checkpoint: Path, progress: dict[str, 
     raise ValueError("checkpoint directory differs from its committed step/milestone")
 
 
-def _progress_and_manifest(config: dict[str, Any], config_path: Path, model: str, model_cfg: dict[str, Any], checkpoint: Path, source_root: Path) -> tuple[dict[str, Any], str]:
+def _progress_and_manifest(
+    config: dict[str, Any],
+    config_path: Path,
+    model: str,
+    model_cfg: dict[str, Any],
+    checkpoint: Path,
+    source_root: Path,
+    *,
+    identity_checkpoint: Path | None = None,
+) -> tuple[dict[str, Any], str]:
     manifest_helper = source_root / "training_state.py"
     if manifest_helper.is_symlink() or not manifest_helper.is_file():
         raise ValueError("native source tree lacks its checkpoint manifest verifier")
@@ -571,7 +670,15 @@ def _progress_and_manifest(config: dict[str, Any], config_path: Path, model: str
     progress = _read_json(checkpoint / "progress.json")
     _validate_progress_shape(model, progress)
     if model == "rdvla":
-        _check_rd_progress(config, _path(config.get("root"), "training root"), source_root, model, progress, checkpoint)
+        _check_rd_progress(
+            config,
+            _path(config.get("root"), "training root", strict=False),
+            source_root,
+            model,
+            progress,
+            checkpoint,
+            identity_checkpoint=identity_checkpoint,
+        )
     else:
         _check_hf_progress(config, config_path, model, model_cfg, progress)
     _validate_checkpoint_name(model, checkpoint, progress, config)
@@ -658,7 +765,13 @@ def _deployment_name(model: str, config: dict[str, Any], checkpoint: Path) -> st
     return value
 
 
-def _build_descriptor(model: str, config_path: Path, checkpoint: Path) -> dict[str, Any]:
+def _build_descriptor(
+    model: str,
+    config_path: Path,
+    checkpoint: Path,
+    *,
+    runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if model not in MODELS:
         raise ValueError(f"model must be one of {MODELS}")
     config_path = Path(config_path).expanduser()
@@ -666,20 +779,37 @@ def _build_descriptor(model: str, config_path: Path, checkpoint: Path) -> dict[s
         raise ValueError("training config must be a regular non-symlink file")
     config_path = config_path.resolve(strict=True)
     config = _json_object(config_path)
-    model_cfg, root, source_root, pythonpath = _verify_model_settings(config, model)
+    if runtime is not None:
+        if model != "rdvla":
+            raise ValueError("runtime relocation is supported only for RD-VLA")
+        runtime = _normalize_runtime(runtime)
+    model_cfg, root, source_root, pythonpath = _verify_model_settings(config, model, runtime=runtime)
     if config.get("action_horizon") != PREDICTION_STEPS or config.get("execution_horizon") != PREDICTION_STEPS:
         raise ValueError("training config must keep both action horizons at 50")
     checkpoint_input = Path(checkpoint).expanduser()
     if checkpoint_input.is_symlink() or not checkpoint_input.is_dir():
         raise ValueError("checkpoint must be an explicit committed directory, not a symlink/latest pointer")
     checkpoint = checkpoint_input.resolve(strict=True)
-    configured_root, _ = _verify_checkpoint_root(config, model, checkpoint)
-    if configured_root != root:
-        raise ValueError("checkpoint training root changed during descriptor preparation")
+    identity_checkpoint = None
+    if runtime is None:
+        configured_root, _ = _verify_checkpoint_root(config, model, checkpoint)
+        if configured_root != root:
+            raise ValueError("checkpoint training root changed during descriptor preparation")
+    else:
+        _verify_runtime_checkpoint(runtime, checkpoint)
+        identity_checkpoint = _original_rd_checkpoint(config, checkpoint)
     source_sha256 = _verify_source_lineage(config, model, source_root)
-    progress, manifest_hash = _progress_and_manifest(config, config_path, model, model_cfg, checkpoint, source_root)
+    progress, manifest_hash = _progress_and_manifest(
+        config,
+        config_path,
+        model,
+        model_cfg,
+        checkpoint,
+        source_root,
+        identity_checkpoint=identity_checkpoint,
+    )
     _check_policy_contract(model, checkpoint / "policy")
-    gpu_uuid = config.get("gpu_uuid")
+    gpu_uuid = config.get("gpu_uuid") if runtime is None else runtime["gpu_uuid"]
     if not isinstance(gpu_uuid, str) or not re.fullmatch(r"GPU-[A-Za-z0-9-]+", gpu_uuid):
         raise ValueError("training config must pin a physical GPU UUID")
     training_config_sha256 = _file_hash(config_path)
@@ -691,7 +821,8 @@ def _build_descriptor(model: str, config_path: Path, checkpoint: Path) -> dict[s
         "semantics": SEMANTICS,
         "checkpoint": str(checkpoint),
         "training_config": str(config_path),
-        "python": str(_executable(model_cfg.get("python"), "training python")),
+        "python": str(_executable(model_cfg.get("python"), "training python"))
+        if runtime is None else runtime["python"],
         "source_root": str(source_root),
         "pythonpath": pythonpath,
         "gpu_uuid": gpu_uuid,
@@ -700,6 +831,8 @@ def _build_descriptor(model: str, config_path: Path, checkpoint: Path) -> dict[s
         "training_config_sha256": training_config_sha256,
         "source_sha256": source_sha256,
     }
+    if runtime is not None:
+        spec["runtime"] = runtime
     spec["artifact"] = _deployment_identity(spec)
     _validate_descriptor(spec, model=model)
     return spec
@@ -729,12 +862,19 @@ def _write_descriptor_no_replace(path: Path, value: dict[str, Any]) -> None:
             pass
 
 
-def prepare_deployment(model: str, config_path: Path, checkpoint: Path, output: Path) -> dict[str, Any]:
+def prepare_deployment(
+    model: str,
+    config_path: Path,
+    checkpoint: Path,
+    output: Path,
+    *,
+    runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Verify one committed checkpoint and write a no-overwrite deployment descriptor."""
     destination = Path(os.path.abspath(Path(output).expanduser()))
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"refusing to overwrite deployment descriptor: {destination}")
-    spec = _build_descriptor(model, Path(config_path), Path(checkpoint))
+    spec = _build_descriptor(model, Path(config_path), Path(checkpoint), runtime=runtime)
     _write_descriptor_no_replace(destination, spec)
     print(
         f"Prepared {model} deployment {spec['deployment']} ({spec['artifact']}) at {destination}",
@@ -860,24 +1000,47 @@ def _verify_full_descriptor(spec: dict[str, Any]) -> tuple[dict[str, Any], dict[
     if not config_path.is_file() or _file_hash(config_path) != spec["training_config_sha256"]:
         raise ValueError("training config changed since descriptor preparation")
     config = _json_object(config_path)
-    model_cfg, root, source_root, pythonpath = _verify_model_settings(config, model)
+    runtime = spec.get("runtime")
+    if runtime is not None:
+        normalized_runtime = _normalize_runtime(runtime)
+        if normalized_runtime != runtime:
+            raise ValueError("runtime settings changed since descriptor preparation")
+        runtime = normalized_runtime
+    model_cfg, root, source_root, pythonpath = _verify_model_settings(config, model, runtime=runtime)
     checkpoint_value = Path(spec["checkpoint"])
     if checkpoint_value.is_symlink():
         raise ValueError("checkpoint path must not be a symlink")
     checkpoint = _path(spec["checkpoint"], "checkpoint")
     if not checkpoint.is_dir():
         raise ValueError("checkpoint is not a regular committed directory")
-    configured_root, _ = _verify_checkpoint_root(config, model, checkpoint)
-    if configured_root != root:
-        raise ValueError("checkpoint root differs from training config")
+    identity_checkpoint = None
+    if runtime is None:
+        configured_root, _ = _verify_checkpoint_root(config, model, checkpoint)
+        if configured_root != root:
+            raise ValueError("checkpoint root differs from training config")
+    else:
+        _verify_runtime_checkpoint(runtime, checkpoint)
+        identity_checkpoint = _original_rd_checkpoint(config, checkpoint)
     expected_source_hash = _verify_source_lineage(config, model, source_root)
     if str(source_root) != spec["source_root"] or pythonpath != spec["pythonpath"]:
         raise ValueError("native source root/PYTHONPATH differs from the pinned config")
-    if str(_executable(model_cfg.get("python"), "training python")) != spec["python"]:
-        raise ValueError("native Python interpreter differs from the pinned config")
-    if config.get("gpu_uuid") != spec["gpu_uuid"] or expected_source_hash != spec["source_sha256"]:
+    if runtime is None:
+        if str(_executable(model_cfg.get("python"), "training python")) != spec["python"]:
+            raise ValueError("native Python interpreter differs from the pinned config")
+        expected_gpu_uuid = config.get("gpu_uuid")
+    else:
+        expected_gpu_uuid = runtime["gpu_uuid"]
+    if expected_gpu_uuid != spec["gpu_uuid"] or expected_source_hash != spec["source_sha256"]:
         raise ValueError("GPU or native source lineage differs from the descriptor")
-    progress, manifest_hash = _progress_and_manifest(config, config_path, model, model_cfg, checkpoint, source_root)
+    progress, manifest_hash = _progress_and_manifest(
+        config,
+        config_path,
+        model,
+        model_cfg,
+        checkpoint,
+        source_root,
+        identity_checkpoint=identity_checkpoint,
+    )
     if progress != spec["progress"] or manifest_hash != spec["checkpoint_manifest_sha256"]:
         raise ValueError("checkpoint progress/manifest changed since descriptor preparation")
     _check_policy_contract(model, checkpoint / "policy")
@@ -1176,8 +1339,6 @@ class AdapterRunner:
         mode = self._ExecutionMode.CHUNK if mode is None else self._ExecutionMode(mode)
         if mode != self._ExecutionMode.CHUNK:
             raise ValueError("native adapters support CHUNK execution only")
-        if inference_delay != 0 or model_continuation is not None or canonical_continuation is not None:
-            raise ValueError("native adapters do not support delay or RTC continuation inputs")
         expected = {item.name: item for item in self._features}
         if set(observation.features) != set(expected):
             raise ValueError("observation features differ from the SO101 contract")

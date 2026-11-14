@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import contextlib
+import enum
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import so101_adapters as adapters
@@ -214,6 +219,263 @@ class AdapterDescriptorTests(unittest.TestCase):
             (checkpoint / "progress.json").write_text(json.dumps(progress), encoding="utf-8")
             with self.assertRaises(ValueError):
                 adapters._verify_full_descriptor(spec)
+
+    def _rd_runtime_fixture(self, base: Path):
+        base = base.resolve()
+        original_root = base / "training"
+        original_source = original_root / "source"
+        (original_source / "RD-VLA").mkdir(parents=True)
+        (original_source / "training_state.py").write_text(
+            "import hashlib, json\n"
+            "def verify_checkpoint_manifest(checkpoint):\n"
+            "    manifest = checkpoint / 'fixture-manifest.json'\n"
+            "    for name, expected in json.loads(manifest.read_text()).items():\n"
+            "        if hashlib.sha256((checkpoint / name).read_bytes()).hexdigest() != expected:\n"
+            "            raise ValueError('checkpoint file differs from committed manifest')\n"
+            "    return hashlib.sha256(manifest.read_bytes()).hexdigest()\n",
+            encoding="utf-8",
+        )
+        adapter_source = (
+            "class FixtureAdapter:\n"
+            "    horizon = 50\n"
+            "    execution_horizon = 50\n"
+            "    def predict(self, batch):\n"
+            "        import torch\n"
+            "        offset = batch['images']['top'].mean() + 2 * batch['images']['wrist'].mean()\n"
+            "        actions = batch['state'] + offset\n"
+            "        return actions.unsqueeze(1).expand(-1, 50, -1).contiguous()\n"
+            "def load(policy_dir, device):\n"
+            "    return FixtureAdapter()\n"
+        )
+        (original_source / "rdvla_adapter.py").write_text(adapter_source, encoding="utf-8")
+        (original_source / "so101_data.py").write_text("# fixture data code\n", encoding="utf-8")
+        (original_source / "train.py").write_text("# fixture launcher\n", encoding="utf-8")
+        (original_source / "RD-VLA/model.py").write_text("# fixture model source\n", encoding="utf-8")
+        config = {
+            "run_id": "fixture-rdvla",
+            "root": str(original_root),
+            "gpu_uuid": "GPU-00000000-0000-0000-0000-000000000000",
+            "manifest_sha256": "a" * 64,
+            "action_horizon": 50,
+            "execution_horizon": 50,
+            "epochs": 2,
+            "wandb_entity": "fixture-entity",
+            "wandb_project": "fixture-project",
+            "source_sha256": adapters._source_tree_identity(original_source),
+            "source_files": adapters._source_tree_records(original_source),
+            "models": {
+                "rdvla": {"python": str(base / "training-host-python"), "wandb_run_id": "fixture-wandb"}
+            },
+        }
+        config_path = base / "training_config.json"
+        config_path.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
+        original_checkpoint = original_root / "runs/rdvla/checkpoints/step-1"
+        policy = original_checkpoint / "policy"
+        policy.mkdir(parents=True)
+        (policy / "model_config.json").write_text(
+            json.dumps(
+                {
+                    "robot_platform": "SO101",
+                    "camera_order": list(adapters.CAMERAS),
+                    "image_sequence_len": 2,
+                    "action_dim": 6,
+                    "action_chunk_len": 50,
+                    "execution_horizon": 50,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (policy / "weights.bin").write_bytes(b"synthetic-checkpoint")
+        progress = {
+            "schema": 1,
+            "status": "checkpoint_committed",
+            "checkpoint": str(original_checkpoint),
+            "identity": {
+                "run_id": config["run_id"],
+                "model": "rdvla",
+                "manifest_sha256": config["manifest_sha256"],
+                "config_sha256": adapters._rd_config_identity(config, config["models"]["rdvla"], "rdvla"),
+                "source_files": config["source_files"],
+                "total_steps": 5,
+            },
+            "wandb": {
+                "id": "fixture-wandb",
+                "entity": config["wandb_entity"],
+                "project": config["wandb_project"],
+            },
+            "global_step": 1,
+            "total_steps": 5,
+            "completed_epochs": 0,
+            "training_samples": 1,
+            "epoch_offset": 1,
+            "frames_per_epoch": 2,
+        }
+        (original_checkpoint / "progress.json").write_text(json.dumps(progress), encoding="utf-8")
+        manifest = {
+            path.relative_to(original_checkpoint).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in original_checkpoint.rglob("*")
+            if path.is_file()
+        }
+        (original_checkpoint / "fixture-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        runtime_root = base / "ubuntu-runtime"
+        runtime_source = runtime_root / "source"
+        shutil.copytree(original_source, runtime_source)
+        checkpoint = runtime_root / "runs/rdvla/checkpoints/step-1"
+        checkpoint.parent.mkdir(parents=True)
+        shutil.copytree(original_checkpoint, checkpoint)
+        return {
+            "config": config,
+            "config_bytes": config_path.read_bytes(),
+            "config_path": config_path,
+            "original_checkpoint": original_checkpoint,
+            "runtime_root": runtime_root,
+            "runtime_source": runtime_source,
+            "checkpoint": checkpoint,
+            "runtime": {
+                "root": str(runtime_root),
+                "python": sys.executable,
+                "gpu_uuid": "GPU-11111111-1111-1111-1111-111111111111",
+            },
+            "output": base / "deployment.json",
+            "adapter_source": adapter_source.encode("utf-8"),
+        }
+
+    def test_rd_runtime_relocation_preserves_identity_and_rejects_tampering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._rd_runtime_fixture(Path(directory))
+            with contextlib.redirect_stderr(io.StringIO()):
+                spec = adapters.prepare_deployment(
+                    "rdvla",
+                    fixture["config_path"],
+                    fixture["checkpoint"],
+                    fixture["output"],
+                    runtime=fixture["runtime"],
+                )
+            self.assertEqual(spec["runtime"], fixture["runtime"])
+            self.assertEqual(spec["training_config"], str(fixture["config_path"].resolve()))
+            self.assertEqual(spec["checkpoint"], str(fixture["checkpoint"]))
+            self.assertEqual(spec["progress"]["checkpoint"], str(fixture["original_checkpoint"]))
+            self.assertEqual(adapters.load_deployment(fixture["output"], model="rdvla"), spec)
+            self.assertEqual(adapters._verify_full_descriptor(spec)[0], fixture["config"])
+            self.assertEqual(fixture["config_path"].read_bytes(), fixture["config_bytes"])
+
+            adapter_file = fixture["runtime_source"] / "rdvla_adapter.py"
+            adapter_file.write_text("# tampered source\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                adapters._verify_full_descriptor(spec)
+            adapter_file.write_bytes(fixture["adapter_source"])
+
+            weights = fixture["checkpoint"] / "policy/weights.bin"
+            weights.write_bytes(b"tampered checkpoint")
+            with self.assertRaisesRegex(ValueError, "checkpoint file differs"):
+                adapters._verify_full_descriptor(spec)
+            weights.write_bytes(b"synthetic-checkpoint")
+
+            tampered = dict(spec)
+            tampered["runtime"] = dict(spec["runtime"], root=str(Path(directory) / "other-runtime"))
+            tampered["artifact"] = adapters._deployment_identity(tampered)
+            with self.assertRaisesRegex(ValueError, "runtime paths or hardware"):
+                adapters._verify_full_descriptor(tampered)
+            self.assertEqual(fixture["config_path"].read_bytes(), fixture["config_bytes"])
+
+    def test_rd_runtime_cpu_native_worker_round_trip(self):
+        try:
+            import numpy as np
+            import torch
+        except ImportError as exc:
+            self.skipTest(f"CPU worker dependencies are unavailable: {exc}")
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._rd_runtime_fixture(Path(directory))
+            with contextlib.redirect_stderr(io.StringIO()):
+                spec = adapters.prepare_deployment(
+                    "rdvla",
+                    fixture["config_path"],
+                    fixture["checkpoint"],
+                    fixture["output"],
+                    runtime=fixture["runtime"],
+                )
+
+            class ExecutionMode(enum.Enum):
+                CHUNK = "chunk"
+                RTC = "rtc"
+
+            class Record:
+                def __init__(self, **values):
+                    self.__dict__.update(values)
+
+            inference = types.ModuleType("lerobot.inference")
+            inference.ActionChunk = Record
+            inference.ActionProvenance = Record
+            inference.ExecutionMode = ExecutionMode
+            inference.PolicyCapabilities = Record
+            lerobot = types.ModuleType("lerobot")
+            lerobot.__path__ = []
+            lerobot.inference = inference
+            features = (
+                SimpleNamespace(
+                    name="observation.state", shape=(6,), dtype="float32",
+                    names=adapters.JOINTS, semantics=adapters.SEMANTICS, kind="tensor",
+                ),
+                SimpleNamespace(
+                    name="observation.images.top", shape=adapters.IMAGE_SHAPE, dtype="uint8",
+                    semantics=adapters.SEMANTICS, kind="rgb",
+                ),
+                SimpleNamespace(
+                    name="observation.images.wrist", shape=adapters.IMAGE_SHAPE, dtype="uint8",
+                    semantics=adapters.SEMANTICS, kind="rgb",
+                ),
+            )
+            action_feature = SimpleNamespace(
+                name="action", shape=(6,), dtype="float32", names=adapters.JOINTS,
+                semantics=adapters.SEMANTICS, kind="tensor",
+            )
+            runner = None
+            try:
+                with patch.dict(sys.modules, {"lerobot": lerobot, "lerobot.inference": inference}):
+                    runner = adapters.AdapterRunner(
+                        spec,
+                        features=features,
+                        action_feature=action_feature,
+                        fps=30,
+                        execution_horizon=7,
+                        device="cpu",
+                    )
+                state = np.arange(1, 7, dtype=np.float32)
+                observation = SimpleNamespace(
+                    features={
+                        "observation.state": state,
+                        "observation.images.top": np.full(adapters.IMAGE_SHAPE, 64, dtype=np.uint8),
+                        "observation.images.wrist": np.full(adapters.IMAGE_SHAPE, 128, dtype=np.uint8),
+                    },
+                    task="fixture task",
+                    capture_time=12.5,
+                    task_version=3,
+                    observation_id="fixture-observation",
+                )
+                chunk = runner.predict(
+                    observation,
+                    mode=ExecutionMode.CHUNK,
+                    inference_delay=2,
+                    model_continuation={"queue": "metadata"},
+                    canonical_continuation={"queue": "metadata"},
+                )
+                actions = chunk.canonical_actions.numpy()
+                expected = state + (64 / 255) + 2 * (128 / 255)
+                self.assertEqual(actions.shape, (7, 6))
+                self.assertEqual(actions.dtype, np.float32)
+                self.assertTrue(np.isfinite(actions).all())
+                np.testing.assert_allclose(actions, np.broadcast_to(expected, (7, 6)), rtol=0, atol=1e-6)
+                self.assertEqual(chunk.execution_steps, 7)
+                self.assertEqual(chunk.provenance.capture_time, observation.capture_time)
+                self.assertEqual(chunk.provenance.task, observation.task)
+                self.assertEqual(chunk.provenance.task_version, observation.task_version)
+                self.assertEqual(chunk.provenance.observation_id, observation.observation_id)
+                self.assertEqual(chunk.canonical_actions.dtype, torch.float32)
+                with self.assertRaisesRegex(ValueError, "CHUNK execution only"):
+                    runner.predict(observation, mode=ExecutionMode.RTC)
+            finally:
+                if runner is not None:
+                    runner.close()
 
 
 class AdapterPipeTests(unittest.TestCase):

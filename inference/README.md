@@ -1,6 +1,85 @@
-# SO101 원격 추론
+# SO101 로컬·원격 추론
 
 `so101_remote.py`는 LeRobot 0.7.0의 native remote server와 rollout을 사용합니다. `so101_adapters.py`는 RD-VLA·AnchorMix-VLA·pi-0.5를 원래 학습 Python/source 환경의 별도 worker에서 실행합니다. 학습 환경이나 체크포인트를 추론 환경으로 덮어쓰지 않습니다.
+
+## Ubuntu RD-VLA 로컬 추론 — 외부 서버 없음
+
+`so101_local.py`는 **로봇·카메라가 연결된 Ubuntu PC에서** RD-VLA 체크포인트를 로드합니다. 수집 환경의 Python과 기존 RD-VLA native Python을 같은 PC의 pipe로 연결하며 TCP 서버·SSH·클라우드 API를 사용하지 않습니다. 두 환경의 Torch/Transformers를 섞거나 학습 환경을 수정하지 않습니다.
+
+필수 준비:
+
+- [Ubuntu 설치](../ubuntu/README.md)로 만든 `ubuntu/.venv`의 LeRobot 0.7.0. 로컬 경로에는 `requirements-server.txt`의 SmolVLA/원격 서버용 Transformers overlay가 필요 없습니다.
+- Ubuntu에서 실행 가능한 **기존 학습과 동일한 RD-VLA native Python 환경**. 이 Python에는 원본 RD-VLA의 Torch·torchvision·Transformers·PEFT·timm 의존성이 있어야 합니다. Mac/다른 서버의 `.venv`를 경로만 바꿔 복사하거나 최신 버전으로 일괄 교체하지 마십시오.
+- 완성된 checkpoint 전체(`policy/`, `training_state/`, `progress.json`, manifest), 원본 `config.json`과 선언된 compatibility config, 고정된 `source/` 전체. 가중치만 복사하면 무결성/학습 계보 검사를 통과하지 못합니다.
+- 승인된 로컬 NVIDIA GPU, 기존 follower 보정 파일, 수집 때와 같은 두 RGB 카메라. 가중치·native 소스·환경은 이 공개 저장소에 포함하지 않습니다. 자동 다운로드·학습은 없습니다.
+
+배치 폴더의 구조를 유지합니다. 원본 config·source·checkpoint 내용은 편집하지 않습니다.
+
+```text
+<LOCAL_ROOT>/
+  config.json
+  source/
+    rdvla_adapter.py
+    training_state.py
+    RD-VLA/
+    ... 원본 config에 고정된 나머지 소스
+  runs/rdvla/checkpoints/epoch-10/
+    ... 원본 committed checkpoint 전체
+```
+
+프로젝트 **루트**에서 아래 변수에 실제 로컬 절대 경로를 지정합니다. `LOCAL_ROOT`는 위 배치 폴더이며 native Python 경로는 아래 runtime JSON에 지정합니다.
+
+```bash
+PY="$PWD/ubuntu/.venv/bin/python"
+LOCAL_ROOT=/absolute/local/rdvla-run
+mkdir -p inference/runtime
+DEPLOYMENT="$PWD/inference/runtime/rdvla-local.deployment.json"
+nvidia-smi --query-gpu=index,uuid,name,memory.free --format=csv
+```
+
+`inference/runtime/rdvla-runtime.json`을 직접 만듭니다. 키는 정확히 `root`, `python`, `gpu_uuid` 세 개이며, GPU UUID는 위 출력에서 **사용 승인된 GPU**를 선택합니다. 다음 값은 형식 설명일 뿐 실제 설정이 아닙니다.
+
+```json
+{
+  "root": "/absolute/local/rdvla-run",
+  "python": "/absolute/local/rdvla-native/bin/python",
+  "gpu_uuid": "GPU-<approved-local-device-UUID>"
+}
+```
+
+```bash
+# 1. CPU 파일/계보 검증과 descriptor 생성. 기존 output은 덮어쓰지 않음.
+"$PY" inference/so101_local.py prepare \
+  --training-config "$LOCAL_ROOT/config.json" \
+  --checkpoint "$LOCAL_ROOT/runs/rdvla/checkpoints/epoch-10" \
+  --runtime-config inference/runtime/rdvla-runtime.json --output "$DEPLOYMENT"
+
+# 2. 실제 로컬 가중치 + 합성 관측. GPU 사용, 로봇/카메라 연결 없음.
+"$PY" inference/so101_local.py smoke --deployment-file "$DEPLOYMENT"
+```
+
+기존 학습 경로·Python·GPU를 그대로 사용하는 동일 호스트라면 `prepare`의 `--runtime-config`를 생략할 수 있습니다. relocation 설정도 descriptor의 artifact 해시에 포함되며 원본 학습 identity·source hash·checkpoint manifest 검사는 유지됩니다. GPU는 UUID로 고정하고 다른 GPU/CPU로 자동 대체하지 않습니다. 기본적으로 점유 GPU를 거부하며, 공유가 승인된 경우에만 `--allow-shared-gpu --memory-limit-gib <승인된_GiB>`를 `smoke`/`run`에 함께 지정합니다(추가 여유 4 GiB 필요). `smoke --device cpu`는 GPU 없는 실제 가중치 검사에만 사용하며 매우 느릴 수 있습니다.
+
+카메라 JSON 계약은 아래 [클라이언트 입력 계약](#클라이언트-입력-계약)과 같습니다. `CAMERAS_JSON`, `ROBOT_PORT`, `ROBOT_ID`, `TASK`에 실제 수집 설정을 지정한 뒤 다음 순서로 진행합니다.
+
+```bash
+# 3. 설정·artifact 검사만 실행. CUDA/카메라/시리얼 접근 없음.
+"$PY" inference/so101_local.py preflight --deployment-file "$DEPLOYMENT" \
+  --robot-port "$ROBOT_PORT" --robot-id "$ROBOT_ID" --cameras "$CAMERAS_JSON" \
+  --task "$TASK" --duration 10
+
+# 4. 사용자가 작업영역·고정·배선·즉시 전원 차단 수단 확인 후 직접 실행.
+# 실제 로봇이 움직입니다.
+"$PY" inference/so101_local.py run --deployment-file "$DEPLOYMENT" \
+  --robot-port "$ROBOT_PORT" --robot-id "$ROBOT_ID" --cameras "$CAMERAS_JSON" \
+  --task "$TASK" --duration 10 --confirm-robot-motion
+```
+
+보정 기본 경로는 `ubuntu/calibration/robots/so_follower/<ROBOT_ID>.json`입니다. `HF_LEROBOT_CALIBRATION`이 있으면 해당 root를 따르며 `--calibration-dir`로 기존 보정 디렉터리를 명시할 수도 있습니다. 자동 재보정하지 않고 모터 보정 불일치는 중단합니다.
+
+로컬 제어는 동기식 CHUNK입니다. native 전처리·학습 통계·50×6 prediction은 그대로 유지하고 `--execution-horizon 1..50`으로 실행할 앞부분만 고릅니다(기본 50). chunk 사이 추론 중에는 새 action을 보내지 않으므로 30 Hz 연속 제어 성능을 보장하지 않습니다. `--fps`는 재생 속도이며 기본 30입니다. `--duration`은 추론 시간을 포함한 양의 유한 초이고, 만료 후 action을 보내지 않습니다. `--max-observation-age`(기본 5초)를 넘긴 관측·비유한 action은 거부합니다.
+
+`--max-relative-target` 기본 5는 native follower의 **한 명령당** 상대 목표 제한입니다(몸체 degree, gripper 0–100 단위). 출력 목표가 제한될 수 있으며 충돌 방지·비상정지가 아닙니다. 정상 종료·예외·Ctrl+C·제어 중 SIGTERM에서 연결된 카메라/시리얼을 정리하고 torque 해제를 시도합니다. 전원 차단 시 팔이 낙하하지 않게 지지하십시오. 실제 GPU/실물 성능은 별도 검증이 필요합니다.
 
 ## 준비물과 공개 범위
 

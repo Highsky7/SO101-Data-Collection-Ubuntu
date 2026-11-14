@@ -1,12 +1,12 @@
-# SO-ARM101 데이터 수집 및 원격 추론
+# SO-ARM101 데이터 수집 및 로컬·원격 추론
 
-LeRobot 0.7.0 기반 SO101 leader–follower 데이터 수집 코드와 Mac–GPU 서버 원격 추론 코드를 관리합니다. 기존 저장소 URL과 `main` 이력은 유지합니다.
+LeRobot 0.7.0 기반 SO101 leader–follower 데이터 수집, Ubuntu RD-VLA 로컬 추론과 Mac–GPU 서버 원격 추론 코드를 관리합니다. 기존 저장소 URL과 `main` 이력은 유지합니다.
 
 ## 구성
 
 - 루트: 기존 Mac 작업 폴더의 `check_environment.py`, `d455_rgb.py`, 의존성 입력·lock, 합성 검사.
 - [`sdk/`](sdk/): macOS D455 RGB용 SDK 빌드 도구와 패치. 바이너리 wheel은 공개하지 않습니다.
-- [`inference/`](inference/README.md): SmolVLA, RD-VLA, AnchorMix-VLA, pi-0.5 원격 추론·배포 descriptor·기존 회귀 검사.
+- [`inference/`](inference/README.md): **Ubuntu RD-VLA 로컬 추론**(`so101_local.py`, 외부 서버 없음), SmolVLA·RD-VLA·AnchorMix-VLA·pi-0.5 원격 추론, 배포 descriptor·회귀 검사.
 - [`ubuntu/`](ubuntu/README.md): 기존 Ubuntu 22.04/24.04 x86_64 수집 구성. **Ubuntu 설치 명령은 이제 `ubuntu/`에서 실행합니다.**
 
 ## Ubuntu에서 새로 설치
@@ -18,6 +18,8 @@ bash setup_ubuntu.sh
 ```
 
 시스템 사전 요구사항과 전체 수집 절차는 [Ubuntu README](ubuntu/README.md) 및 [한국어 수집 가이드](ubuntu/SO101_데이터수집_가이드.md)를 확인하십시오. 기존 환경·데이터를 덮어쓰지 않습니다.
+
+RD-VLA를 로봇과 같은 Ubuntu PC에서 실행하려면 [로컬 추론 절차](inference/README.md#ubuntu-rd-vla-로컬-추론--외부-서버-없음)를 따르십시오. `prepare → smoke → preflight → run`을 제공하며, 실제 가중치·고정 native 소스/Python 환경·보정 파일·승인된 NVIDIA GPU는 별도 필요합니다. 자동 학습·다운로드·로봇 실행은 하지 않습니다.
 
 ## Mac의 기존 환경에서 사용
 

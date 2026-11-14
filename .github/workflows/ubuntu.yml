@@ -54,6 +54,13 @@ jobs:
           .venv/bin/lerobot-setup-motors --help
           .venv/bin/lerobot-find-cameras --help
           .venv/bin/lerobot-dataset-viz --help
+      - name: Check local RD-VLA CLI without hardware or model dependencies
+        run: |
+          .venv/bin/python ../inference/so101_local.py --help
+          .venv/bin/python ../inference/so101_local.py prepare --help
+          .venv/bin/python ../inference/so101_local.py smoke --help
+          .venv/bin/python ../inference/so101_local.py preflight --help
+          .venv/bin/python ../inference/so101_local.py run --help
       - name: Run hardware-free regression check
         run: .venv/bin/python check_environment.py
       - name: Run hardware-free inference regressions
