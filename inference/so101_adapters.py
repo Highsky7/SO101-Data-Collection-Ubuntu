@@ -1260,6 +1260,7 @@ class AdapterRunner:
             pass
         self._cpu_threads = config_threads
         self._lock = threading.Lock()
+        self._termination_lock = threading.Lock()
         self._closed = False
         self._reply_fd, reply_write_fd = os.pipe()
         os.set_blocking(self._reply_fd, False)
@@ -1409,34 +1410,48 @@ class AdapterRunner:
         raise ValueError("native SO101 adapters do not support language queries")
 
     def _terminate_worker(self) -> None:
-        if getattr(self, "_closed", True):
-            return
-        self._closed = True
-        proc = getattr(self, "_proc", None)
-        if proc is not None and proc.poll() is None:
+        with self._termination_lock:
+            if self._closed:
+                return
+            self._closed = True
+            proc = getattr(self, "_proc", None)
             try:
-                proc.terminate()
-                proc.wait(timeout=CLOSE_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            except ProcessLookupError:
-                proc.wait()
-        if proc is not None and proc.stdin is not None:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-        fd = getattr(self, "_reply_fd", None)
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            self._reply_fd = None
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        proc.wait(timeout=CLOSE_TIMEOUT)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            proc.wait(timeout=CLOSE_TIMEOUT)
+                        except subprocess.TimeoutExpired:
+                            pass
+            finally:
+                if proc is not None and proc.stdin is not None:
+                    try:
+                        proc.stdin.close()
+                    except OSError:
+                        pass
+                fd = getattr(self, "_reply_fd", None)
+                if fd is not None:
+                    self._reply_fd = None
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
     def close(self) -> None:
-        with getattr(self, "_lock", threading.Lock()):
+        lock = getattr(self, "_lock", None)
+        if lock is None or not lock.acquire(blocking=False):
+            self._terminate_worker()
+            return
+        try:
             if self._closed:
                 return
             try:
@@ -1444,7 +1459,10 @@ class AdapterRunner:
                     self._request({"op": "close"}, (), CLOSE_TIMEOUT)
             except (BrokenPipeError, EOFError, OSError, RuntimeError, TimeoutError, ValueError):
                 pass
-            self._terminate_worker()
+            finally:
+                self._terminate_worker()
+        finally:
+            lock.release()
 
 
 if __name__ == "__main__":

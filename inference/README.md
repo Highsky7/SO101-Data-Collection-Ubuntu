@@ -54,7 +54,7 @@ nvidia-smi --query-gpu=index,uuid,name,memory.free --format=csv
   --checkpoint "$LOCAL_ROOT/runs/rdvla/checkpoints/epoch-10" \
   --runtime-config inference/runtime/rdvla-runtime.json --output "$DEPLOYMENT"
 
-# 2. 실제 로컬 가중치 + 합성 관측. GPU 사용, 로봇/카메라 연결 없음.
+# 2. 실제 체크포인트로 합성 관측 1회 추론. GPU 사용, 로봇/카메라 연결 없음; 연속 비동기 제어의 증명은 아님.
 "$PY" inference/so101_local.py smoke --deployment-file "$DEPLOYMENT"
 ```
 
@@ -66,20 +66,26 @@ nvidia-smi --query-gpu=index,uuid,name,memory.free --format=csv
 # 3. 설정·artifact 검사만 실행. CUDA/카메라/시리얼 접근 없음.
 "$PY" inference/so101_local.py preflight --deployment-file "$DEPLOYMENT" \
   --robot-port "$ROBOT_PORT" --robot-id "$ROBOT_ID" --cameras "$CAMERAS_JSON" \
-  --task "$TASK" --duration 10
+  --task "$TASK" --duration 10 --refill-seconds 0.5 --startup-timeout 120 \
+  --action-timeout 10 --max-observation-age 5
 
 # 4. 사용자가 작업영역·고정·배선·즉시 전원 차단 수단 확인 후 직접 실행.
 # 실제 로봇이 움직입니다.
 "$PY" inference/so101_local.py run --deployment-file "$DEPLOYMENT" \
   --robot-port "$ROBOT_PORT" --robot-id "$ROBOT_ID" --cameras "$CAMERAS_JSON" \
-  --task "$TASK" --duration 10 --confirm-robot-motion
+  --task "$TASK" --duration 10 --refill-seconds 0.5 --startup-timeout 120 \
+  --action-timeout 10 --max-observation-age 5 --confirm-robot-motion
 ```
 
 보정 기본 경로는 `ubuntu/calibration/robots/so_follower/<ROBOT_ID>.json`입니다. `HF_LEROBOT_CALIBRATION`이 있으면 해당 root를 따르며 `--calibration-dir`로 기존 보정 디렉터리를 명시할 수도 있습니다. 자동 재보정하지 않고 모터 보정 불일치는 중단합니다.
 
-로컬 제어는 동기식 CHUNK입니다. native 전처리·학습 통계·50×6 prediction은 그대로 유지하고 `--execution-horizon 1..50`으로 실행할 앞부분만 고릅니다(기본 50). chunk 사이 추론 중에는 새 action을 보내지 않으므로 30 Hz 연속 제어 성능을 보장하지 않습니다. `--fps`는 재생 속도이며 기본 30입니다. `--duration`은 추론 시간을 포함한 양의 유한 초이고, 만료 후 action을 보내지 않습니다. `--max-observation-age`(기본 5초)를 넘긴 관측·비유한 action은 거부합니다.
+로컬 `run`은 비동기 CHUNK append 재생입니다. background prediction worker는 native LeRobot `ChunkRuntime`을 통해 CPU action queue를 채우고, control loop는 추론 중에도 이미 큐에 있는 action을 재생합니다. resident model은 하나, in-flight prediction request도 최대 하나입니다. `--refill-seconds 0.5`는 refill lead 설정이며 runtime은 측정된 prediction turnaround에 맞춰 headroom을 조정하고 최소한 turnaround + 한 control tick을 확보합니다. `--startup-timeout 120`은 worker/model startup 제한, `--action-timeout 10`은 prediction request 제한이며, 기존 `--max-observation-age` 기본값 5초를 넘은 관측과 invalid action은 거부합니다.
 
-`--max-relative-target` 기본 5는 native follower의 **한 명령당** 상대 목표 제한입니다(몸체 degree, gripper 0–100 단위). 출력 목표가 제한될 수 있으며 충돌 방지·비상정지가 아닙니다. 정상 종료·예외·Ctrl+C·제어 중 SIGTERM에서 연결된 카메라/시리얼을 정리하고 torque 해제를 시도합니다. 전원 차단 시 팔이 낙하하지 않게 지지하십시오. 실제 GPU/실물 성능은 별도 검증이 필요합니다.
+Native 전처리·학습 통계·50×6 prediction과 기존 32-step recurrence는 바꾸지 않습니다. `--execution-horizon 1..50`은 생성된 chunk 중 재생할 앞부분만 고르며(기본 50), model prediction horizon을 바꾸지 않습니다. RTC-trained/guided 동작은 없습니다. `--fps`는 playback 목표 속도이며 기본 30이고, `--duration`은 추론을 포함한 양의 유한 초입니다. duration 만료 뒤에는 action을 더 보내지 않습니다.
+
+재생 중 action buffer가 소진되거나 invalid/stale action, worker 오류, startup/action timeout이 생기면 fail closed로 중단하고 teardown합니다. 동작 중단 뒤 도착한 prediction 결과는 버리고, action을 반복하거나 stale/zero action으로 메우거나 recovery grace를 두지 않습니다. 30 Hz·zero-latency를 보장하지 않으며, 실제 GPU·카메라·control jitter는 측정되지 않았습니다. RTX 5070 Ti Laptop GPU 12 GB에서도 작동·성능·메모리 여유를 보장하지 않습니다.
+
+`--max-relative-target` 기본 5는 native follower의 **한 명령당** 상대 목표 제한입니다(몸체 degree, gripper 0–100 단위). 출력 목표가 제한될 수 있으며 충돌 방지·비상정지가 아닙니다. 정상 종료·예외·Ctrl+C·제어 중 SIGTERM에서는 먼저 pending generation을 무효화하고 연결된 카메라/시리얼을 정리한 뒤 torque 해제를 시도합니다. hardware disconnect가 끝난 다음 native runner를 닫아 대기 중인 pipe 호출을 중단하고 inference worker를 join합니다. 따라서 model shutdown을 기다리는 동안 카메라·모터 연결을 유지하지 않습니다. 전원 차단 시 팔이 낙하하지 않게 지지하십시오. 실제 GPU/실물 성능은 별도 검증이 필요합니다.
 
 ## 준비물과 공개 범위
 

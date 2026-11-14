@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from types import SimpleNamespace
@@ -220,7 +222,7 @@ class AdapterDescriptorTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 adapters._verify_full_descriptor(spec)
 
-    def _rd_runtime_fixture(self, base: Path):
+    def _rd_runtime_fixture(self, base: Path, *, adapter_source: str | None = None):
         base = base.resolve()
         original_root = base / "training"
         original_source = original_root / "source"
@@ -235,18 +237,19 @@ class AdapterDescriptorTests(unittest.TestCase):
             "    return hashlib.sha256(manifest.read_bytes()).hexdigest()\n",
             encoding="utf-8",
         )
-        adapter_source = (
-            "class FixtureAdapter:\n"
-            "    horizon = 50\n"
-            "    execution_horizon = 50\n"
-            "    def predict(self, batch):\n"
-            "        import torch\n"
-            "        offset = batch['images']['top'].mean() + 2 * batch['images']['wrist'].mean()\n"
-            "        actions = batch['state'] + offset\n"
-            "        return actions.unsqueeze(1).expand(-1, 50, -1).contiguous()\n"
-            "def load(policy_dir, device):\n"
-            "    return FixtureAdapter()\n"
-        )
+        if adapter_source is None:
+            adapter_source = (
+                "class FixtureAdapter:\n"
+                "    horizon = 50\n"
+                "    execution_horizon = 50\n"
+                "    def predict(self, batch):\n"
+                "        import torch\n"
+                "        offset = batch['images']['top'].mean() + 2 * batch['images']['wrist'].mean()\n"
+                "        actions = batch['state'] + offset\n"
+                "        return actions.unsqueeze(1).expand(-1, 50, -1).contiguous()\n"
+                "def load(policy_dir, device):\n"
+                "    return FixtureAdapter()\n"
+            )
         (original_source / "rdvla_adapter.py").write_text(adapter_source, encoding="utf-8")
         (original_source / "so101_data.py").write_text("# fixture data code\n", encoding="utf-8")
         (original_source / "train.py").write_text("# fixture launcher\n", encoding="utf-8")
@@ -474,6 +477,151 @@ class AdapterDescriptorTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "CHUNK execution only"):
                     runner.predict(observation, mode=ExecutionMode.RTC)
             finally:
+                if runner is not None:
+                    runner.close()
+
+
+    def test_close_interrupts_inflight_native_prediction(self):
+        try:
+            import numpy as np
+            import torch
+        except ImportError as exc:
+            self.skipTest(f"CPU worker dependencies are unavailable: {exc}")
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            marker = base / "prediction-started"
+            adapter_source = (
+                "import time\n"
+                "class FixtureAdapter:\n"
+                "    horizon = 50\n"
+                "    execution_horizon = 50\n"
+                "    def predict(self, batch):\n"
+                f"        open({str(marker)!r}, 'w', encoding='utf-8').write('started')\n"
+                "        while True:\n"
+                "            time.sleep(1)\n"
+                "def load(policy_dir, device):\n"
+                "    return FixtureAdapter()\n"
+            )
+            fixture = self._rd_runtime_fixture(base, adapter_source=adapter_source)
+            with contextlib.redirect_stderr(io.StringIO()):
+                spec = adapters.prepare_deployment(
+                    "rdvla",
+                    fixture["config_path"],
+                    fixture["checkpoint"],
+                    fixture["output"],
+                    runtime=fixture["runtime"],
+                )
+
+            class ExecutionMode(enum.Enum):
+                CHUNK = "chunk"
+                RTC = "rtc"
+
+            class Record:
+                def __init__(self, **values):
+                    self.__dict__.update(values)
+
+            inference = types.ModuleType("lerobot.inference")
+            inference.ActionChunk = Record
+            inference.ActionProvenance = Record
+            inference.ExecutionMode = ExecutionMode
+            inference.PolicyCapabilities = Record
+            lerobot = types.ModuleType("lerobot")
+            lerobot.__path__ = []
+            lerobot.inference = inference
+            features = (
+                SimpleNamespace(
+                    name="observation.state", shape=(6,), dtype="float32",
+                    names=adapters.JOINTS, semantics=adapters.SEMANTICS, kind="tensor",
+                ),
+                SimpleNamespace(
+                    name="observation.images.top", shape=adapters.IMAGE_SHAPE, dtype="uint8",
+                    semantics=adapters.SEMANTICS, kind="rgb",
+                ),
+                SimpleNamespace(
+                    name="observation.images.wrist", shape=adapters.IMAGE_SHAPE, dtype="uint8",
+                    semantics=adapters.SEMANTICS, kind="rgb",
+                ),
+            )
+            action_feature = SimpleNamespace(
+                name="action", shape=(6,), dtype="float32", names=adapters.JOINTS,
+                semantics=adapters.SEMANTICS, kind="tensor",
+            )
+            runner = None
+            prediction_thread = None
+            close_thread = None
+            results = []
+            prediction_errors = []
+            close_errors = []
+            try:
+                with patch.dict(sys.modules, {"lerobot": lerobot, "lerobot.inference": inference}):
+                    runner = adapters.AdapterRunner(
+                        spec,
+                        features=features,
+                        action_feature=action_feature,
+                        fps=30,
+                        execution_horizon=7,
+                        device="cpu",
+                    )
+                worker = runner._proc
+                observation = SimpleNamespace(
+                    features={
+                        "observation.state": np.arange(1, 7, dtype=np.float32),
+                        "observation.images.top": np.full(adapters.IMAGE_SHAPE, 64, dtype=np.uint8),
+                        "observation.images.wrist": np.full(adapters.IMAGE_SHAPE, 128, dtype=np.uint8),
+                    },
+                    task="fixture task",
+                    capture_time=12.5,
+                    task_version=3,
+                    observation_id="blocking-observation",
+                )
+
+                def predict():
+                    try:
+                        results.append(runner.predict(observation, mode=ExecutionMode.CHUNK))
+                    except BaseException as exc:
+                        prediction_errors.append(exc)
+
+                def close():
+                    try:
+                        runner.close()
+                    except BaseException as exc:
+                        close_errors.append(exc)
+
+                prediction_thread = threading.Thread(target=predict, name="adapter-predict-regression")
+                prediction_thread.start()
+                deadline = time.monotonic() + 10
+                while not marker.exists() and time.monotonic() < deadline and worker.poll() is None:
+                    time.sleep(0.01)
+                self.assertTrue(marker.exists(), "synthetic adapter prediction did not reach its blocking point")
+
+                close_thread = threading.Thread(target=close, name="adapter-close-regression", daemon=True)
+                started = time.monotonic()
+                close_thread.start()
+                close_thread.join(timeout=2)
+                close_duration = time.monotonic() - started
+                if close_thread.is_alive():
+                    runner._terminate_worker()
+                close_thread.join(timeout=10)
+                prediction_thread.join(timeout=10)
+
+                self.assertLess(close_duration, 2, "close waited for the in-flight prediction lock")
+                self.assertFalse(close_thread.is_alive(), "close thread did not exit")
+                self.assertFalse(prediction_thread.is_alive(), "prediction thread did not exit after worker termination")
+                self.assertEqual(close_errors, [])
+                self.assertIsNotNone(worker.poll(), "native worker survived close")
+                self.assertEqual(results, [], "close returned a stale prediction result")
+                self.assertEqual(len(prediction_errors), 1)
+                with self.assertRaisesRegex(RuntimeError, "closed or has exited"):
+                    runner.predict(observation, mode=ExecutionMode.CHUNK)
+                self.assertIs(runner._proc, worker, "closed runner unexpectedly accepted/restarted work")
+                runner.close()
+            finally:
+                if runner is not None:
+                    runner._terminate_worker()
+                if prediction_thread is not None:
+                    prediction_thread.join(timeout=10)
+                if close_thread is not None:
+                    close_thread.join(timeout=10)
                 if runner is not None:
                     runner.close()
 

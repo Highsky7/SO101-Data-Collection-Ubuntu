@@ -42,7 +42,7 @@ python check_environment.py
 
 ## RD-VLA 로컬 추론
 
-수집과 같은 Ubuntu PC의 GPU에서 실행하는 [`so101_local.py` 안내](../inference/README.md#ubuntu-rd-vla-로컬-추론--외부-서버-없음)를 따르십시오. 프로젝트 루트에서 `ubuntu/.venv/bin/python inference/so101_local.py --help`로 명령을 확인합니다. 기존 수집 환경은 CPU 전용이어도 되며, 모델은 별도의 로컬 RD-VLA native Python/CUDA 환경에서 실행합니다. 외부 추론 서버·SSH 터널은 필요 없습니다. 가중치·원본 학습 source/config·native 환경은 별도로 준비해야 합니다.
+수집과 같은 Ubuntu PC의 GPU에서 실행하는 [`so101_local.py` 안내](../inference/README.md#ubuntu-rd-vla-로컬-추론--외부-서버-없음)를 따르십시오. 프로젝트 루트에서 `ubuntu/.venv/bin/python inference/so101_local.py --help`로 명령을 확인합니다. 기존 수집 환경은 CPU 전용이어도 되며, 모델은 별도의 로컬 RD-VLA native Python/CUDA 환경에서 실행합니다. `run`은 background worker가 예측하는 동안 action buffer의 CHUNK를 재생하며, 외부 추론 서버·SSH 터널은 필요 없습니다. 가중치·원본 학습 source/config·native 환경은 별도로 준비해야 합니다.
 
 ## 안전과 공개 범위
 

@@ -19,7 +19,7 @@ bash setup_ubuntu.sh
 
 시스템 사전 요구사항과 전체 수집 절차는 [Ubuntu README](ubuntu/README.md) 및 [한국어 수집 가이드](ubuntu/SO101_데이터수집_가이드.md)를 확인하십시오. 기존 환경·데이터를 덮어쓰지 않습니다.
 
-RD-VLA를 로봇과 같은 Ubuntu PC에서 실행하려면 [로컬 추론 절차](inference/README.md#ubuntu-rd-vla-로컬-추론--외부-서버-없음)를 따르십시오. `prepare → smoke → preflight → run`을 제공하며, 실제 가중치·고정 native 소스/Python 환경·보정 파일·승인된 NVIDIA GPU는 별도 필요합니다. 자동 학습·다운로드·로봇 실행은 하지 않습니다.
+RD-VLA를 로봇과 같은 Ubuntu PC에서 실행하려면 [로컬 추론 절차](inference/README.md#ubuntu-rd-vla-로컬-추론--외부-서버-없음)를 따르십시오. `prepare → smoke → preflight → run`을 제공하며, 실제 가중치·고정 native 소스/Python 환경·보정 파일·승인된 NVIDIA GPU는 별도 필요합니다. `run`은 background prediction worker와 action buffer를 사용하는 비동기 CHUNK 재생입니다. 자동 학습·다운로드는 없으며, 로봇 구동은 사용자가 `--confirm-robot-motion`을 지정할 때만 시작합니다.
 
 ## Mac의 기존 환경에서 사용
 

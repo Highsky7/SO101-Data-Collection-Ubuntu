@@ -1,4 +1,4 @@
-"""RD-VLA inference on this Ubuntu host: local native worker, no server or SSH.
+"""Asynchronous RD-VLA CHUNK inference on this Ubuntu host; no server or SSH.
 
 prepare/preflight never open hardware or initialize CUDA. smoke loads real local
 weights with synthetic observations. Only run connects cameras and moves motors.
@@ -14,6 +14,7 @@ from pathlib import Path
 import signal
 import sys
 import time
+from threading import Condition, Event, Thread
 
 import so101_adapters as adapters
 import so101_remote as shared
@@ -74,32 +75,137 @@ def snapshot(observation, task, capture_time):
     )
 
 
-def control_loop(robot, runner, args):
-    """Synchronous CHUNK playback; no catch-up bursts and no commands after expiry."""
-    import torch
+class LocalChunkEngine:
+    """One local predictor, bounded handoff, and LeRobot's shared CHUNK scheduler."""
 
+    def __init__(self, runner, args, *, clock=None):
+        from lerobot.inference import ChunkRuntime, ExecutionMode
+
+        self.runner = runner
+        self.execution_horizon = args.execution_horizon
+        self.runtime = ChunkRuntime(
+            mode=ExecutionMode.CHUNK, action_interval=1.0 / args.fps,
+            refill_seconds=args.refill_seconds, max_observation_age_s=args.max_observation_age,
+            startup_timeout_s=args.startup_timeout, action_timeout_s=args.action_timeout,
+            clock=clock or time.monotonic,
+        )
+        self._condition = Condition()
+        self._stop = Event()
+        self._observation = None
+        self._thread = None
+        self._error = None
+
+    def start(self):
+        if self._thread is not None or self._stop.is_set():
+            raise RuntimeError("Local inference engine cannot be restarted")
+        self.runtime.activate()
+        self._thread = Thread(target=self._loop, name="LocalRDVLAInference", daemon=True)
+        self._thread.start()
+
+    def needs_observation(self):
+        with self._condition:
+            if self._stop.is_set() or self._observation is not None:
+                return False
+        return self.runtime.should_request()
+
+    def submit(self, observation):
+        with self._condition:
+            if not self._stop.is_set():
+                self._observation = observation
+                self._condition.notify()
+
+    def _loop(self):
+        import torch
+
+        try:
+            while not self._stop.is_set():
+                with self._condition:
+                    self._condition.wait_for(lambda: self._stop.is_set() or self._observation is not None)
+                    if self._stop.is_set():
+                        return
+                    observation, self._observation = self._observation, None
+                request = self.runtime.begin(observation)
+                if request is None:
+                    continue
+                chunk = self.runner.predict(
+                    observation, mode=request.mode, inference_delay=request.delay,
+                    model_continuation=request.continuation.model_actions,
+                    canonical_continuation=request.continuation.canonical_actions,
+                )
+                if self._stop.is_set():
+                    return
+                actions = chunk.canonical_actions
+                if (
+                    actions.shape != (self.execution_horizon, len(shared.JOINTS))
+                    or chunk.execution_steps != self.execution_horizon
+                    or actions.dtype != torch.float32 or actions.device.type != "cpu"
+                    or not bool(torch.isfinite(actions).all())
+                ):
+                    raise ValueError("RD-VLA must return finite CPU float32 [execution_horizon,6] actions")
+                accepted = self.runtime.accept(request, chunk, task_version=observation.task_version)
+                logging.info(
+                    "Local RD-VLA prediction: %.3fs accepted=%s queued=%.3fs refill=%.3fs",
+                    self.runtime.clock() - request.submitted_at, accepted,
+                    self.runtime.queue.qsize() * self.runtime.interval, self.runtime.effective_refill,
+                )
+        except Exception as exc:
+            if not self._stop.is_set():
+                self._error = exc
+                self.runtime.fault(f"{type(exc).__name__}: {exc}")
+
+    def raise_if_failed(self):
+        self.runtime.check_deadlines()
+        if self.runtime.failure is not None:
+            raise RuntimeError(f"Local RD-VLA inference stopped: {self.runtime.failure}") from self._error
+
+    def stop(self):
+        with self._condition:
+            if self._stop.is_set():
+                return
+            self._stop.set()
+            self._observation = None
+            self._condition.notify_all()
+        self.runtime.deactivate()
+
+    def close(self):
+        self.stop()
+        try:
+            # AdapterRunner.close interrupts a pending native pipe call.
+            self.runner.close()
+        finally:
+            if self._thread is not None:
+                self._thread.join(timeout=adapters.CLOSE_TIMEOUT)
+                if self._thread.is_alive():
+                    raise RuntimeError("Local inference thread did not stop after native worker shutdown")
+
+
+def control_loop(robot, engine, args):
+    """Capture on refill demand; dispatch queued actions independently of prediction."""
     deadline = time.monotonic() + args.duration
     interval = 1.0 / args.fps
-    while time.monotonic() < deadline:
-        captured = time.monotonic()
-        observation = snapshot(robot.get_observation(), args.task, captured)
-        started = time.monotonic()
-        chunk = runner.predict(observation)
-        actions = chunk.canonical_actions
-        if (
-            actions.shape != (args.execution_horizon, len(shared.JOINTS))
-            or actions.dtype != torch.float32 or not bool(torch.isfinite(actions).all())
-        ):
-            raise ValueError("RD-VLA must return finite float32 [execution_horizon,6] actions")
-        logging.info("Local RD-VLA prediction: %.3f seconds", time.monotonic() - started)
-        for row in actions.cpu().numpy():
+    engine.start()
+    try:
+        while time.monotonic() < deadline:
             tick = time.monotonic()
-            if tick >= deadline:
-                return
-            if tick - captured > args.max_observation_age:
-                raise TimeoutError("RD-VLA observation expired; refusing stale motor commands")
-            robot.send_action(dict(zip(shared.JOINTS, map(float, row))))
+            engine.raise_if_failed()
+            if engine.needs_observation():
+                captured = time.monotonic()
+                observation = snapshot(robot.get_observation(), args.task, captured)
+                if time.monotonic() >= deadline:
+                    break
+                engine.submit(observation)
+            item = engine.runtime.pop()
+            engine.raise_if_failed()
+            if item is not None:
+                action, _ = item
+                with engine.runtime.lock:
+                    engine.raise_if_failed()
+                    if time.monotonic() < deadline and engine.runtime.dispatch_allowed():
+                        robot.send_action(dict(zip(shared.JOINTS, map(float, action.numpy()))))
+            # No catch-up bursts after slow camera/serial I/O.
             time.sleep(min(max(0.0, interval - (time.monotonic() - tick)), max(0.0, deadline - time.monotonic())))
+    finally:
+        engine.stop()
 
 
 def close_robot(robot):
@@ -118,13 +224,18 @@ def run_robot(config, runner, args):
     if not Path(config.port).exists():
         raise FileNotFoundError(f"Follower serial device does not exist: {config.port}")
     robot = SO101Follower(config)
+    engine = LocalChunkEngine(runner, args)
     try:
         robot.connect(calibrate=False)
         if not robot.is_calibrated:
             raise RuntimeError("Motor calibration differs from the existing file; calibrate separately before inference")
-        control_loop(robot, runner, args)
+        control_loop(robot, engine, args)
     finally:
-        close_robot(robot)
+        engine.stop()
+        try:
+            close_robot(robot)
+        finally:
+            engine.close()
 
 
 def main(argv=None):
@@ -154,6 +265,9 @@ def main(argv=None):
             sub.add_argument("--duration", type=shared.positive_seconds, required=True, help="finite positive seconds including inference time")
             sub.add_argument("--max-relative-target", type=shared.positive_seconds, default=5.0, help="native per-command limit: body degrees, gripper 0–100 units; not collision avoidance")
             sub.add_argument("--max-observation-age", type=shared.positive_seconds, default=5.0)
+            sub.add_argument("--refill-seconds", type=shared.positive_seconds, default=0.5, help="queued playback threshold; native scheduler also reserves measured inference headroom")
+            sub.add_argument("--startup-timeout", type=shared.positive_seconds, default=120.0, help="seconds allowed for the first usable action")
+            sub.add_argument("--action-timeout", type=shared.positive_seconds, default=10.0, help="seconds allowed for each background prediction; expiry stops motion")
         if command == "run":
             sub.add_argument("--confirm-robot-motion", action="store_true", help="confirm workspace, power cutoff and actual motor motion")
     args = parser.parse_args(argv)
@@ -175,7 +289,15 @@ def main(argv=None):
             adapters._verify_full_descriptor(spec)
             import draccus
 
-            print(json.dumps({"model": "rdvla", "transport": "local process pipes; no network", "artifact": spec["artifact"], "robot": draccus.encode(config)}, indent=2))
+            print(json.dumps({
+                "model": "rdvla", "transport": "local process pipes; no network",
+                "artifact": spec["artifact"], "robot": draccus.encode(config),
+                "execution": {
+                    "mode": "async_chunk", "fps": args.fps, "execution_horizon": args.execution_horizon,
+                    "refill_seconds": args.refill_seconds, "startup_timeout": args.startup_timeout,
+                    "action_timeout": args.action_timeout, "max_observation_age": args.max_observation_age,
+                },
+            }, indent=2))
             print("PASS: local configuration and artifact verified; no GPU, cameras, serial ports or motors opened")
             return
         with closing(load_runner(spec, args)) as runner:
